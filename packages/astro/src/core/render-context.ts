@@ -19,6 +19,7 @@ import { renderEndpoint } from '../runtime/server/endpoint.js';
 import { renderPage } from '../runtime/server/index.js';
 import {
 	ASTRO_VERSION,
+	DEFAULT_404_COMPONENT,
 	REROUTE_DIRECTIVE_HEADER,
 	ROUTE_TYPE_HEADER,
 	clientAddressSymbol,
@@ -37,6 +38,9 @@ import { type Pipeline, Slots, getParams, getProps } from './render/index.js';
  * It contains data unique to each request. It is responsible for executing middleware, calling endpoints, and rendering the page by gathering necessary data from a `Pipeline`.
  */
 export class RenderContext {
+	// The first route that this instance of the context attempts to render
+	originalRoute: RouteData;
+
 	private constructor(
 		readonly pipeline: Pipeline,
 		public locals: App.Locals,
@@ -48,7 +52,9 @@ export class RenderContext {
 		protected cookies = new AstroCookies(request),
 		public params = getParams(routeData, pathname),
 		protected url = new URL(request.url)
-	) {}
+	) {
+		this.originalRoute = routeData;
+	}
 
 	/**
 	 * A flag that tells the render content if the rewriting was triggered
@@ -119,18 +125,15 @@ export class RenderContext {
 		const lastNext = async (ctx: APIContext, payload?: RewritePayload) => {
 			if (payload) {
 				if (this.pipeline.manifest.rewritingEnabled) {
-					try {
-						const [routeData, component] = await pipeline.tryRewrite(payload, this.request);
-						this.routeData = routeData;
-						componentInstance = component;
-					} catch (e) {
-						return new Response('Not found', {
-							status: 404,
-							statusText: 'Not found',
-						});
-					} finally {
-						this.isRewriting = true;
-					}
+					// we intentionally let the error bubble up
+					const [routeData, component] = await pipeline.tryRewrite(
+						payload,
+						this.request,
+						this.originalRoute
+					);
+					this.routeData = routeData;
+					componentInstance = component;
+					this.isRewriting = true;
 				} else {
 					this.pipeline.logger.warn(
 						'router',
@@ -146,6 +149,10 @@ export class RenderContext {
 				case 'page': {
 					const result = await this.createResult(componentInstance!);
 					let response: Response;
+					// no need to bother rendering a mock route 404, let's create a 404 straight away
+					// if (this.routeData.component === DEFAULT_404_COMPONENT) {
+					// response = new Response(null, { status: 404, statusText: 'Not Found' });
+					// } else {
 					try {
 						response = await renderPage(
 							result,
@@ -161,6 +168,8 @@ export class RenderContext {
 						result.cancelled = true;
 						throw e;
 					}
+					// }
+
 					// Signal to the i18n middleware to maybe act on this response
 					response.headers.set(ROUTE_TYPE_HEADER, 'page');
 					// Signal to the error-page-rerouting infra to let this response pass through to avoid loops
@@ -213,29 +222,25 @@ export class RenderContext {
 
 		const rewrite = async (reroutePayload: RewritePayload) => {
 			pipeline.logger.debug('router', 'Called rewriting to:', reroutePayload);
-			try {
-				const [routeData, component] = await pipeline.tryRewrite(reroutePayload, this.request);
-				this.routeData = routeData;
-				if (reroutePayload instanceof Request) {
-					this.request = reroutePayload;
-				} else {
-					this.request = new Request(
-						new URL(routeData.pathname ?? routeData.route, this.url.origin),
-						this.request
-					);
-				}
-				this.url = new URL(this.request.url);
-				this.cookies = new AstroCookies(this.request);
-				this.params = getParams(routeData, url.toString());
-				this.isRewriting = true;
-				return await this.render(component);
-			} catch (e) {
-				pipeline.logger.debug('router', 'Rewrite failed.', e);
-				return new Response('Not found', {
-					status: 404,
-					statusText: 'Not found',
-				});
+			const [routeData, component] = await pipeline.tryRewrite(
+				reroutePayload,
+				this.request,
+				this.originalRoute
+			);
+			this.routeData = routeData;
+			if (reroutePayload instanceof Request) {
+				this.request = reroutePayload;
+			} else {
+				this.request = new Request(
+					new URL(routeData.pathname ?? routeData.route, this.url.origin),
+					this.request
+				);
 			}
+			this.url = new URL(this.request.url);
+			this.cookies = new AstroCookies(this.request);
+			this.params = getParams(routeData, url.toString());
+			this.isRewriting = true;
+			return await this.render(component);
 		};
 
 		return {
@@ -404,30 +409,26 @@ export class RenderContext {
 		};
 
 		const rewrite = async (reroutePayload: RewritePayload) => {
-			try {
-				pipeline.logger.debug('router', 'Calling rewrite: ', reroutePayload);
-				const [routeData, component] = await pipeline.tryRewrite(reroutePayload, this.request);
-				this.routeData = routeData;
-				if (reroutePayload instanceof Request) {
-					this.request = reroutePayload;
-				} else {
-					this.request = new Request(
-						new URL(routeData.pathname ?? routeData.route, this.url.origin),
-						this.request
-					);
-				}
-				this.url = new URL(this.request.url);
-				this.cookies = new AstroCookies(this.request);
-				this.params = getParams(routeData, url.toString());
-				this.isRewriting = true;
-				return await this.render(component);
-			} catch (e) {
-				pipeline.logger.debug('router', 'Rerouting failed, returning a 404.', e);
-				return new Response('Not found', {
-					status: 404,
-					statusText: 'Not found',
-				});
+			pipeline.logger.debug('router', 'Calling rewrite: ', reroutePayload);
+			const [routeData, component] = await pipeline.tryRewrite(
+				reroutePayload,
+				this.request,
+				this.originalRoute
+			);
+			this.routeData = routeData;
+			if (reroutePayload instanceof Request) {
+				this.request = reroutePayload;
+			} else {
+				this.request = new Request(
+					new URL(routeData.pathname ?? routeData.route, this.url.origin),
+					this.request
+				);
 			}
+			this.url = new URL(this.request.url);
+			this.cookies = new AstroCookies(this.request);
+			this.params = getParams(routeData, url.toString());
+			this.isRewriting = true;
+			return await this.render(component);
 		};
 
 		return {
